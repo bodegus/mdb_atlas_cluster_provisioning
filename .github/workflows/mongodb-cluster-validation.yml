@@ -1,0 +1,282 @@
+name: MongoDB Atlas Cluster Validation
+
+on:
+  push:
+    branches:
+      - '**'
+    paths:
+      - 'deploy_**'
+      - 'scripts/**'
+      - '.github/workflows/mongodb-cluster-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  discover-configurations:
+    name: Discover Deployment Configurations
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+      count: ${{ steps.build-matrix.outputs.count }}
+      has_configs: ${{ steps.build-matrix.outputs.has_configs }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build deployment matrix
+        id: build-matrix
+        run: |
+          set -euo pipefail
+
+          # Initialize matrix with include array
+          JSON='{"include":[]}'
+
+          # Find directories starting with deploy_
+          echo "🔍 Discovering cluster deployment directories..."
+          cluster_dirs=$(find . -maxdepth 1 -type d -name "deploy_*" | sort)
+
+          if [ -z "$cluster_dirs" ]; then
+            echo "❌ ERROR: No deploy_ directories found in repository root"
+            echo "Expected to find directories matching pattern: deploy_*"
+            exit 1
+          else
+            echo "Found cluster directories:"
+            echo "$cluster_dirs" | sed 's|^\./||'
+          fi
+
+          for cluster_dir in $cluster_dirs; do
+            cluster_type=$(basename "$cluster_dir")
+            echo "Processing $cluster_type..."
+
+            # Verify terraform directory exists
+            if [ ! -d "$cluster_dir/terraform" ]; then
+              echo "  ❌ ERROR: $cluster_type missing required terraform/ directory"
+              echo "  Expected structure: $cluster_type/terraform/"
+              exit 1
+            fi
+
+            # Find .tfvars files in the root of the cluster directory
+            tfvars_found=false
+            for tfvar_file in "$cluster_dir"/*.tfvars; do
+              if [ -f "$tfvar_file" ]; then
+                tfvars_found=true
+                filename=$(basename "$tfvar_file")
+                env_name="${filename%.tfvars}"
+
+                echo "  Found environment: $env_name ($filename)"
+
+                # Add to matrix using jq for proper JSON handling
+                JSON=$(echo "$JSON" | jq \
+                  --arg deployment "$cluster_type" \
+                  --arg env "$env_name" \
+                  --arg path "$tfvar_file" \
+                  '.include += [{"deployment": $deployment, "environment": $env, "tfvar_path": $path}]')
+              fi
+            done
+
+            if [ "$tfvars_found" = false ]; then
+              echo "  ❌ ERROR: No .tfvars files found in $cluster_type"
+              echo "  Expected files like: dev.tfvars, nonprod.tfvars, prod.tfvars"
+              exit 1
+            fi
+          done
+
+          # Count configurations
+          COUNT=$(echo "$JSON" | jq '.include | length')
+
+          # Set outputs
+          if [ "$COUNT" -eq 0 ]; then
+            echo "has_configs=false" >> $GITHUB_OUTPUT
+            echo "❌ No valid deployment configurations found - validation will be skipped"
+          else
+            echo "has_configs=true" >> $GITHUB_OUTPUT
+            echo "✅ Found $COUNT deployment configurations"
+          fi
+
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+          # Write matrix as multiline output to avoid issues with special characters
+          {
+            echo "matrix<<EOF"
+            echo "$JSON"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+          # Display matrix for debugging
+          echo ""
+          echo "Generated deployment matrix:"
+          echo "$JSON" | jq .
+
+  validate:
+    name: Validate ${{ matrix.environment }} - ${{ matrix.deployment }}
+    needs: discover-configurations
+    if: needs.discover-configurations.outputs.has_configs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover-configurations.outputs.matrix) }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.12"
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: GitHubActions-MongoValidation-${{ matrix.environment }}
+
+      - name: Display configuration details
+        run: |
+          echo "🔍 Validating configuration:"
+          echo "  Deployment: ${{ matrix.deployment }}"
+          echo "  Environment: ${{ matrix.environment }}"
+          echo "  TFVars Path: ${{ matrix.tfvar_path }}"
+
+      - name: Step 1 - Initialize Terraform and Run Pre-commit
+        id: init
+        run: |
+          echo "🚀 Step 1: Initializing Terraform and running pre-commit hooks..."
+          ./scripts/tf_init_flexible.sh "${{ matrix.deployment }}" "${{ matrix.tfvar_path }}"
+
+      - name: Step 2 - Generate Terraform Plan
+        id: plan
+        if: steps.init.outcome == 'success'
+        run: |
+          echo "📋 Step 2: Generating Terraform plan..."
+          ./scripts/tf_plan_flexible.sh "${{ matrix.deployment }}" "${{ matrix.tfvar_path }}"
+
+      - name: Step 3 - Apply with Timeout (Validation)
+        id: apply
+        if: steps.plan.outcome == 'success'
+        continue-on-error: true
+        shell: bash {0}  # Don't exit on error - we handle exit codes
+        run: |
+          echo "🔄 Step 3: Running Terraform apply with 30s timeout for validation..."
+          ./scripts/tf_apply_flexible.sh "${{ matrix.deployment }}" "${{ matrix.tfvar_path }}" 30
+          APPLY_EXIT_CODE=$?
+
+          echo "apply_exit_code=$APPLY_EXIT_CODE" >> $GITHUB_OUTPUT
+
+          if [ "$APPLY_EXIT_CODE" = "0" ]; then
+            echo "## ✅ ${{ matrix.environment }} - ${{ matrix.deployment }}: Validation Passed" >> $GITHUB_STEP_SUMMARY
+            echo "MongoDB Atlas API accepted the configuration. Timeout occurred as expected." >> $GITHUB_STEP_SUMMARY
+            echo "Configuration file: ${{ matrix.tfvar_path }}" >> $GITHUB_STEP_SUMMARY
+          elif [ "$APPLY_EXIT_CODE" = "1" ]; then
+            echo "## ❌ ${{ matrix.environment }} - ${{ matrix.deployment }}: Validation Failed" >> $GITHUB_STEP_SUMMARY
+            echo "MongoDB Atlas API rejected the configuration. Check the logs for details." >> $GITHUB_STEP_SUMMARY
+            echo "Configuration file: ${{ matrix.tfvar_path }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ⚠️ ${{ matrix.environment }} - ${{ matrix.deployment }}: Unexpected Error" >> $GITHUB_STEP_SUMMARY
+            echo "Configuration file: ${{ matrix.tfvar_path }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          exit $APPLY_EXIT_CODE
+
+      - name: Step 4 - Destroy Resources (Cleanup)
+        id: destroy
+        if: always() && (steps.apply.outcome == 'success' || steps.apply.outcome == 'failure')
+        continue-on-error: true
+        shell: bash {0}  # Don't exit on error
+        run: |
+          echo "🗑️ Step 4: Cleaning up resources with destroy (10 min timeout)..."
+          ./scripts/tf_destroy_flexible.sh "${{ matrix.deployment }}" "${{ matrix.tfvar_path }}" 600 true
+          DESTROY_EXIT_CODE=$?
+
+          if [ "$DESTROY_EXIT_CODE" = "0" ]; then
+            echo "✅ Cleanup completed successfully"
+            echo "cleanup_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Cleanup had issues (exit code: $DESTROY_EXIT_CODE)"
+            echo "cleanup_status=warning" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Final Validation Result
+        if: always()
+        shell: bash {0}
+        run: |
+          APPLY_CODE="${{ steps.apply.outputs.apply_exit_code }}"
+          CLEANUP_STATUS="${{ steps.destroy.outputs.cleanup_status }}"
+
+          echo ""
+          echo "========================================="
+          echo "FINAL VALIDATION RESULT"
+          echo "Deployment: ${{ matrix.deployment }}"
+          echo "Environment: ${{ matrix.environment }}"
+          echo "Apply Exit Code: $APPLY_CODE"
+          echo "Cleanup Status: $CLEANUP_STATUS"
+          echo "========================================="
+
+          # The overall validation result is based on the apply step
+          if [ "$APPLY_CODE" = "0" ]; then
+            echo "✅ Overall Result: VALIDATION PASSED (Apply succeeded)"
+            exit 0
+          elif [ "$APPLY_CODE" = "124" ]; then
+            echo "✅ Overall Result: VALIDATION PASSED (Timeout as expected)"
+            exit 0
+          elif [ "$APPLY_CODE" = "1" ]; then
+            echo "❌ Overall Result: VALIDATION FAILED (API rejected config)"
+            exit 1
+          else
+            echo "⚠️ Overall Result: UNEXPECTED ERROR (Exit code: $APPLY_CODE)"
+            exit 2
+          fi
+
+  summary:
+    name: Validation Summary
+    runs-on: ubuntu-latest
+    needs: [discover-configurations, validate]
+    if: always()
+
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "# MongoDB Atlas Cluster Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Display discovery results
+          TOTAL_CONFIGS="${{ needs.discover-configurations.outputs.count }}"
+          HAS_CONFIGS="${{ needs.discover-configurations.outputs.has_configs }}"
+
+          if [ "$HAS_CONFIGS" = "false" ]; then
+            echo "## ℹ️ No configurations found for validation" >> $GITHUB_STEP_SUMMARY
+            echo "No directories starting with 'deploy_' containing .tfvars files were discovered." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Total Configurations:** $TOTAL_CONFIGS" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            # Display validation results
+            VALIDATION_RESULT="${{ needs.validate.result }}"
+
+            if [ "$VALIDATION_RESULT" = "success" ]; then
+              echo "## ✅ All validations passed!" >> $GITHUB_STEP_SUMMARY
+              echo "All $TOTAL_CONFIGS configurations were successfully validated." >> $GITHUB_STEP_SUMMARY
+            elif [ "$VALIDATION_RESULT" = "failure" ]; then
+              echo "## ❌ One or more validations failed" >> $GITHUB_STEP_SUMMARY
+              echo "Check the individual job logs for details." >> $GITHUB_STEP_SUMMARY
+              exit 1
+            elif [ "$VALIDATION_RESULT" = "skipped" ]; then
+              echo "## ⚠️ Validations were skipped" >> $GITHUB_STEP_SUMMARY
+              echo "This may be due to no configurations being discovered." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "## ⚠️ Validation status: $VALIDATION_RESULT" >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Dynamic discovery automatically finds deploy_* directories and their .tfvars files.*" >> $GITHUB_STEP_SUMMARY
+          echo "*Validation uses a 30-second timeout to verify API acceptance without creating clusters.*" >> $GITHUB_STEP_SUMMARY

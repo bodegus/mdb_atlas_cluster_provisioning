@@ -1,0 +1,345 @@
+name: MongoDB Atlas Cluster Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment:
+        description: 'Deployment to run (optional - leave empty for all)'
+        required: false
+        type: string
+      environment:
+        description: 'Specific environment to deploy (optional - leave empty for all)'
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  discover-deployments:
+    name: Discover Deployment Configurations
+    runs-on: ubuntu-latest
+    outputs:
+      deployment_matrix: ${{ steps.build-deployment-matrix.outputs.deployment_matrix }}
+      has_deployments: ${{ steps.build-deployment-matrix.outputs.has_deployments }}
+      total_deployments: ${{ steps.build-deployment-matrix.outputs.total_deployments }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build deployment matrix
+        id: build-deployment-matrix
+        run: |
+          set -euo pipefail
+
+          # Initialize deployment matrix
+          DEPLOYMENT_JSON='{"include":[]}'
+
+          # Find directories starting with deploy_
+          echo "🔍 Discovering deployment directories..."
+          deployment_dirs=$(find . -maxdepth 1 -type d -name "deploy_*" | sort)
+
+          if [ -z "$deployment_dirs" ]; then
+            echo "❌ ERROR: No deploy_ directories found in repository root"
+            echo "has_deployments=false" >> $GITHUB_OUTPUT
+            echo "total_deployments=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Found deployment directories:"
+          echo "$deployment_dirs" | sed 's|^./||'
+
+          # Filter by specific deployment if provided
+          if [ -n "${{ github.event.inputs.deployment }}" ]; then
+            deployment_dirs=$(echo "$deployment_dirs" | grep "deploy_${{ github.event.inputs.deployment }}" || true)
+            if [ -z "$deployment_dirs" ]; then
+              echo "❌ ERROR: Deployment '${{ github.event.inputs.deployment }}' not found"
+              echo "has_deployments=false" >> $GITHUB_OUTPUT
+              echo "total_deployments=0" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          fi
+
+          # Build sequential deployment list
+          for deployment_dir in $deployment_dirs; do
+            deployment_name=$(basename "$deployment_dir")
+            echo "Processing $deployment_name..."
+
+            # Verify terraform directory exists
+            if [ ! -d "$deployment_dir/terraform" ]; then
+              echo "  ❌ ERROR: $deployment_name missing required terraform/ directory"
+              exit 1
+            fi
+
+            # Find .tfvars files in alphabetical order
+            tfvars_files=$(find "$deployment_dir" -maxdepth 1 -name "*.tfvars" | sort)
+
+            if [ -z "$tfvars_files" ]; then
+              echo "  ❌ ERROR: No .tfvars files found in $deployment_name"
+              exit 1
+            fi
+
+            # Filter by specific environment if provided
+            if [ -n "${{ github.event.inputs.environment }}" ]; then
+              tfvars_files=$(echo "$tfvars_files" | grep "${{ github.event.inputs.environment }}.tfvars" || true)
+              if [ -z "$tfvars_files" ]; then
+                echo "  ⚠️ WARNING: Environment '${{ github.event.inputs.environment }}' not found in $deployment_name"
+                continue
+              fi
+            fi
+
+            # Add each environment to the deployment matrix
+            for tfvar_file in $tfvars_files; do
+              filename=$(basename "$tfvar_file")
+              env_name="${filename%.tfvars}"
+
+              echo "  Found environment: $env_name ($filename)"
+
+              DEPLOYMENT_JSON=$(echo "$DEPLOYMENT_JSON" | jq \
+                --arg deployment "$deployment_name" \
+                --arg env "$env_name" \
+                --arg path "$tfvar_file" \
+                '.include += [{"deployment": $deployment, "environment": $env, "tfvar_path": $path}]')
+            done
+          done
+
+          # Count total deployments
+          TOTAL_DEPLOYMENTS=$(echo "$DEPLOYMENT_JSON" | jq '.include | length')
+
+          # Set outputs
+          if [ "$TOTAL_DEPLOYMENTS" -eq 0 ]; then
+            echo "has_deployments=false" >> $GITHUB_OUTPUT
+            echo "total_deployments=0" >> $GITHUB_OUTPUT
+            echo "❌ No valid deployment configurations found"
+          else
+            echo "has_deployments=true" >> $GITHUB_OUTPUT
+            echo "total_deployments=$TOTAL_DEPLOYMENTS" >> $GITHUB_OUTPUT
+            echo "✅ Found $TOTAL_DEPLOYMENTS deployment configurations"
+          fi
+
+          # Write deployment matrix as multiline output
+          {
+            echo "deployment_matrix<<EOF"
+            echo "$DEPLOYMENT_JSON"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+          # Display matrix for debugging
+          echo ""
+          echo "Generated deployment matrix:"
+          echo "$DEPLOYMENT_JSON" | jq .
+
+  plan:
+    name: Plan - ${{ matrix.environment }} (${{ matrix.deployment }})
+    needs: discover-deployments
+    if: needs.discover-deployments.outputs.has_deployments == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.discover-deployments.outputs.deployment_matrix) }}
+    environment:
+      name: plan-${{ matrix.deployment }}-${{ matrix.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.12"
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: GitHubActions-MongoDeploy-Plan-${{ matrix.environment }}
+
+      - name: Install MongoDB Atlas CLI
+        run: |
+          echo "Installing MongoDB Atlas CLI..."
+          curl -LO https://fastdl.mongodb.org/mongocli/mongodb-atlas-cli_1.14.0_linux_x86_64.tar.gz
+          tar -xzf mongodb-atlas-cli_1.14.0_linux_x86_64.tar.gz
+          sudo mv mongodb-atlas-cli_1.14.0_linux_x86_64/bin/atlas /usr/local/bin/
+          atlas --version
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Initialize Terraform
+        run: |
+          echo "🔧 Initializing Terraform for ${{ matrix.deployment }}/${{ matrix.environment }}..."
+          ./scripts/tf_init_flexible.sh "${{ matrix.deployment }}" "${{ matrix.tfvar_path }}"
+
+      - name: Generate Terraform Plan
+        env:
+          TF_VAR_TIMEOUT: 1800
+        run: |
+          echo "📋 Generating Terraform plan for ${{ matrix.deployment }}/${{ matrix.environment }}..."
+          ./scripts/tf_plan_flexible.sh "${{ matrix.deployment }}" "${{ matrix.tfvar_path }}"
+
+      - name: Plan Summary
+        run: |
+          echo "## 📋 Plan Generated - ${{ matrix.environment }} (${{ matrix.deployment }})" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment:** ${{ matrix.deployment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Configuration:** ${{ matrix.tfvar_path }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Terraform plan generated successfully. Ready for approval to proceed with apply." >> $GITHUB_STEP_SUMMARY
+
+  apply:
+    name: Apply - ${{ matrix.environment }} (${{ matrix.deployment }})
+    needs: [discover-deployments, plan]
+    if: needs.discover-deployments.outputs.has_deployments == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.discover-deployments.outputs.deployment_matrix) }}
+    environment:
+      name: deploy-${{ matrix.deployment }}-${{ matrix.environment }}
+      url: https://cloud.mongodb.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.12"
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: GitHubActions-MongoDeploy-Apply-${{ matrix.environment }}
+
+      - name: Install MongoDB Atlas CLI
+        run: |
+          echo "Installing MongoDB Atlas CLI..."
+          curl -LO https://fastdl.mongodb.org/mongocli/mongodb-atlas-cli_1.14.0_linux_x86_64.tar.gz
+          tar -xzf mongodb-atlas-cli_1.14.0_linux_x86_64.tar.gz
+          sudo mv mongodb-atlas-cli_1.14.0_linux_x86_64/bin/atlas /usr/local/bin/
+          atlas --version
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Initialize Terraform
+        run: |
+          echo "🔧 Re-initializing Terraform for ${{ matrix.deployment }}/${{ matrix.environment }}..."
+          ./scripts/tf_init_flexible.sh "${{ matrix.deployment }}" "${{ matrix.tfvar_path }}"
+
+      - name: Apply Terraform Changes
+        env:
+          TF_VAR_TIMEOUT: 1800
+        run: |
+          echo "🚀 Applying Terraform changes for ${{ matrix.deployment }}/${{ matrix.environment }}..."
+          ./scripts/tf_apply_flexible.sh "${{ matrix.deployment }}" "${{ matrix.tfvar_path }}" 1800
+
+      - name: Collect Terraform Outputs
+        id: outputs
+        working-directory: ${{ matrix.deployment }}/terraform
+        run: |
+          echo "📊 Collecting Terraform outputs..."
+          if terraform output -json > outputs.json 2>/dev/null; then
+            echo "outputs_available=true" >> $GITHUB_OUTPUT
+            echo "Terraform outputs collected successfully"
+          else
+            echo "outputs_available=false" >> $GITHUB_OUTPUT
+            echo "No Terraform outputs available"
+          fi
+
+      - name: Display Outputs
+        if: steps.outputs.outputs.outputs_available == 'true'
+        working-directory: ${{ matrix.deployment }}/terraform
+        run: |
+          echo "📊 Terraform Outputs for ${{ matrix.deployment }}/${{ matrix.environment }}:"
+          cat outputs.json | jq '.'
+
+      - name: Apply Summary
+        run: |
+          echo "## 🚀 Apply Completed - ${{ matrix.environment }} (${{ matrix.deployment }})" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment:** ${{ matrix.deployment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Configuration:** ${{ matrix.tfvar_path }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ MongoDB Atlas cluster deployment completed successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 [View in MongoDB Atlas](https://cloud.mongodb.com)" >> $GITHUB_STEP_SUMMARY
+
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [discover-deployments, apply]
+    if: always()
+
+    steps:
+      - name: Generate Deployment Summary
+        run: |
+          echo "# MongoDB Atlas Cluster Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Display discovery results
+          TOTAL_DEPLOYMENTS="${{ needs.discover-deployments.outputs.total_deployments }}"
+          HAS_DEPLOYMENTS="${{ needs.discover-deployments.outputs.has_deployments }}"
+
+          if [ "$HAS_DEPLOYMENTS" = "false" ]; then
+            echo "## ℹ️ No deployments found or executed" >> $GITHUB_STEP_SUMMARY
+            if [ -n "${{ github.event.inputs.deployment }}" ] || [ -n "${{ github.event.inputs.environment }}" ]; then
+              echo "Filters applied:" >> $GITHUB_STEP_SUMMARY
+              echo "- Deployment: ${{ github.event.inputs.deployment || 'all' }}" >> $GITHUB_STEP_SUMMARY
+              echo "- Environment: ${{ github.event.inputs.environment || 'all' }}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "No deploy_ directories with .tfvars files were found in the repository." >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "**Total Deployments Processed:** $TOTAL_DEPLOYMENTS" >> $GITHUB_STEP_SUMMARY
+
+            if [ -n "${{ github.event.inputs.deployment }}" ] || [ -n "${{ github.event.inputs.environment }}" ]; then
+              echo "**Filters Applied:**" >> $GITHUB_STEP_SUMMARY
+              echo "- Deployment: ${{ github.event.inputs.deployment || 'all' }}" >> $GITHUB_STEP_SUMMARY
+              echo "- Environment: ${{ github.event.inputs.environment || 'all' }}" >> $GITHUB_STEP_SUMMARY
+            fi
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            # Display apply results
+            APPLY_RESULT="${{ needs.apply.result }}"
+
+            if [ "$APPLY_RESULT" = "success" ]; then
+              echo "## ✅ All deployments completed successfully!" >> $GITHUB_STEP_SUMMARY
+              echo "All $TOTAL_DEPLOYMENTS MongoDB Atlas clusters were deployed successfully." >> $GITHUB_STEP_SUMMARY
+            elif [ "$APPLY_RESULT" = "failure" ]; then
+              echo "## ❌ One or more deployments failed" >> $GITHUB_STEP_SUMMARY
+              echo "Check the individual job logs for details. Failed deployments may need manual intervention." >> $GITHUB_STEP_SUMMARY
+            elif [ "$APPLY_RESULT" = "cancelled" ]; then
+              echo "## ⚠️ Deployments were cancelled" >> $GITHUB_STEP_SUMMARY
+              echo "The deployment process was cancelled before completion." >> $GITHUB_STEP_SUMMARY
+            elif [ "$APPLY_RESULT" = "skipped" ]; then
+              echo "## ⚠️ Deployments were skipped" >> $GITHUB_STEP_SUMMARY
+              echo "This may be due to missing approvals or no valid configurations." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "## ⚠️ Deployment status: $APPLY_RESULT" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "🔍 *Dynamic discovery finds deploy_* directories and processes .tfvars files sequentially*" >> $GITHUB_STEP_SUMMARY
+          echo "🛡️ *Each environment requires manual approval before deployment*" >> $GITHUB_STEP_SUMMARY
+          echo "⏱️ *Deployments use 30-minute timeout for full cluster provisioning*" >> $GITHUB_STEP_SUMMARY

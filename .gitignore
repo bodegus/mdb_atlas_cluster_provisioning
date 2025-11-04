@@ -1,0 +1,52 @@
+# Terraform
+**/.terraform/
+**/.terraform.lock.hcl
+**/terraform.tfstate
+**/terraform.tfstate.backup
+**/terraform.tfvars
+**/terraform.tfplan
+**/.terraform.tfstate.lock.info
+**plan.json**
+**plan.out**
+**tfplan**
+# Lambda Source Code
+**/.lambda-src/
+.env
+
+# IDE and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Environment and secrets
+.env
+.env.local
+secrets.tfvars
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+.venv/
+.ENV/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+venv*
