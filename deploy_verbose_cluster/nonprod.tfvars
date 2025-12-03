@@ -16,13 +16,6 @@ replication_specs = [{
         node_count    = 3
         disk_size_gb  = 100
       }
-
-      analytics_specs = {
-        instance_size = "M10"
-        node_count    = 1
-        disk_size_gb  = 100
-      }
-
       # Auto-scaling for this region
       auto_scaling = {
         compute_enabled            = true
@@ -31,7 +24,6 @@ replication_specs = [{
         compute_scale_down_enabled = true
         disk_gb_enabled            = true
       }
-
 
     },
     {
@@ -44,7 +36,6 @@ replication_specs = [{
         node_count    = 2
         disk_size_gb  = 100
       }
-
       # Auto-scaling for this region
       auto_scaling = {
         compute_enabled            = true
@@ -53,6 +44,7 @@ replication_specs = [{
         compute_scale_down_enabled = true
         disk_gb_enabled            = true
       }
+
     }
   ]
 }]
