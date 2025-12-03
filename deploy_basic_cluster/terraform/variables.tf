@@ -49,40 +49,6 @@ variable "auto_scaling" {
   }
 }
 
-variable "backup_enabled" {
-  description = "Enable cloud backups"
-  type        = bool
-  default     = true
-}
-
-variable "pit_enabled" {
-  description = "Enable Point-in-Time recovery"
-  type        = bool
-  default     = true
-}
-
-variable "termination_protection_enabled" {
-  description = "Enable termination protection"
-  type        = bool
-  default     = false
-}
-
-variable "advanced_configuration" {
-  description = "Advanced cluster configuration"
-  type = object({
-    default_write_concern        = optional(string, "majority")
-    javascript_enabled           = optional(bool, false)
-    minimum_enabled_tls_protocol = optional(string, "TLS1_2")
-    no_table_scan                = optional(bool)
-    oplog_min_retention_hours    = optional(number)
-  })
-  default = {
-    default_write_concern        = "majority"
-    javascript_enabled           = false
-    minimum_enabled_tls_protocol = "TLS1_2"
-  }
-}
-
 variable "environment" {
   description = "Environment name (dev, nonprod, prod)"
   type        = string
@@ -91,36 +57,6 @@ variable "environment" {
     condition     = contains(["dev", "nonprod", "prod"], var.environment)
     error_message = "Environment must be one of: dev, nonprod, prod"
   }
-}
-
-variable "team" {
-  description = "Team responsible for the cluster"
-  type        = string
-}
-
-variable "application" {
-  description = "Application name"
-  type        = string
-}
-
-variable "department" {
-  description = "Department name"
-  type        = string
-}
-
-variable "app_version" {
-  description = "Application version"
-  type        = string
-}
-
-variable "email" {
-  description = "Contact email"
-  type        = string
-}
-
-variable "criticality" {
-  description = "Criticality level (low, medium, high)"
-  type        = string
 }
 
 variable "timeout" {

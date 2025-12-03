@@ -5,10 +5,13 @@ regions = [
     name         = "US_EAST_1"
     node_count   = 3
     shard_number = 1
+  },
+  {
+    name         = "US_EAST_1"
+    node_count   = 3
+    shard_number = 2
   }
 ]
-
-termination_protection_enabled = false
 
 # Customer meta data
 environment = "nonprod"

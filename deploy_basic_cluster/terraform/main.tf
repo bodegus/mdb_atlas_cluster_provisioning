@@ -38,39 +38,16 @@ module "mongodb_cluster" {
   project_id             = var.project_id
   name                   = "${var.cluster_name}-${random_string.suffix.result}"
   mongo_db_major_version = var.mongo_db_major_version
-  cluster_type           = "SHARDED"
+  cluster_type           = "REPLICASET"
   provider_name          = "AWS"
-
 
   # Use the new regions format instead of replication_specs
   regions = var.regions
 
-  # Auto-scaling configuration (module has good defaults)
-  auto_scaling = var.auto_scaling
-
-  # Backup configuration
-  backup_enabled = var.backup_enabled
-  pit_enabled    = var.pit_enabled
-
   # Security defaults from module
-  redact_client_log_data         = var.environment == "prod"
-  termination_protection_enabled = var.termination_protection_enabled
+  termination_protection_enabled = false
 
-  # Advanced configuration with security defaults
-  advanced_configuration = var.advanced_configuration
-
-  tags = {
-    environment = var.environment
-    team        = var.team
-    application = var.application
-    department  = var.department
-    version     = var.app_version
-    email       = var.email
-    criticality = var.criticality
-  }
-
-
-  # Timeout would normally not be set, this value is intended to optimize ci test cycles
+  # Timeout would normally not be set, this value is intended to optimize for TF Demos
   timeouts = {
     create = var.timeout
   }

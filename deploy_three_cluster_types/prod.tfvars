@@ -13,8 +13,6 @@ regions = [
   }
 ]
 
-termination_protection_enabled = false
-
 environment = "prod"
 team        = "DevOps"
 application = "MongoDB Atlas Example"

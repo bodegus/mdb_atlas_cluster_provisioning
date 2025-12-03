@@ -2,17 +2,10 @@ cluster_name = "e-clus-dev"
 cluster_type = "REPLICASET"
 regions = [
   {
-    name          = "US_EAST_1"
-    node_count    = 3
-    instance_size = "M30"
+    name       = "US_EAST_1"
+    node_count = 3
   }
 ]
-
-auto_scaling = {
-  compute_enabled = false
-}
-
-termination_protection_enabled = false
 
 # Customer meta data
 environment = "dev"
